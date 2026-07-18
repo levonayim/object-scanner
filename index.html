@@ -334,12 +334,16 @@
       <button class="ghost file-btn">Upload photo
         <input type="file" id="fileInput" accept="image/*">
       </button>
+      <label class="threshold-row" style="cursor:pointer;">
+        <input type="checkbox" id="autoIdentifyToggle" checked style="accent-color: var(--laser);">
+        <span>AUTO-IDENTIFY</span>
+      </label>
       <div class="threshold-row">
-        <span>SENSITIVITY</span>
+        <span id="sensitivityLabel">SENSITIVITY · AUTO</span>
         <input type="range" id="thresholdSlider" min="10" max="90" value="38">
       </div>
     </div>
-    <div class="hint">Works best with objects on a plain, fairly uniform background (a table, mat, or sheet of paper) — the scanner separates objects by detecting where the background stops. Adjust sensitivity if it misses edges or merges objects together.</div>
+    <div class="hint">Works best with objects on a plain, fairly uniform background (a table, mat, or sheet of paper) — the scanner separates objects by detecting where the background stops. Sensitivity is picked automatically per photo; drag the slider to override it manually.</div>
   </div>
 
   <div class="divider">
@@ -369,6 +373,8 @@
   const retakeBtn = document.getElementById('retakeBtn');
   const fileInput = document.getElementById('fileInput');
   const thresholdSlider = document.getElementById('thresholdSlider');
+  const sensitivityLabel = document.getElementById('sensitivityLabel');
+  const autoIdentifyToggle = document.getElementById('autoIdentifyToggle');
   const sheet = document.getElementById('sheet');
   const countLabel = document.getElementById('countLabel');
   const workCanvas = document.getElementById('workCanvas');
@@ -376,6 +382,7 @@
   let stream = null;
   let sourceImageData = null; // ImageData of the working (downscaled) captured photo
   let sourceCanvas = null;    // canvas holding the source image at working resolution
+  let autoThreshold = true;   // true until the user manually drags the slider
 
   const MAX_DIM = 720;
 
@@ -388,8 +395,23 @@
       viewfinder.classList.remove('captured');
       vfPlaceholder.style.display = 'none';
       startBtn.style.display = 'none';
-      captureBtn.disabled = false;
       retakeBtn.style.display = 'none';
+
+      // Don't allow capture until the video actually has frame data —
+      // grabbing a frame too early produces a blank canvas on many phones,
+      // which the segmenter reads as "no objects".
+      captureBtn.disabled = true;
+      captureBtn.textContent = 'Loading camera…';
+      const markReady = () => {
+        if(video.videoWidth > 0 && video.videoHeight > 0){
+          captureBtn.disabled = false;
+          captureBtn.textContent = 'Capture';
+        }
+      };
+      video.addEventListener('loadedmetadata', markReady, { once: true });
+      video.addEventListener('canplay', markReady, { once: true });
+      // Safety net in case events already fired before listeners attached
+      setTimeout(markReady, 300);
     }catch(err){
       vfPlaceholder.innerHTML = "CAMERA UNAVAILABLE<br>" + (err && err.message ? err.message : "permission denied") + "<br>try uploading a photo instead";
       vfPlaceholder.style.display = 'block';
@@ -397,8 +419,13 @@
   });
 
   captureBtn.addEventListener('click', () => {
-    const w = video.videoWidth || 640;
-    const h = video.videoHeight || 480;
+    const w = video.videoWidth, h = video.videoHeight;
+    if(!w || !h){
+      vfStatus.classList.add('show');
+      vfStatus.textContent = 'CAMERA NOT READY — TRY AGAIN';
+      setTimeout(() => vfStatus.classList.remove('show'), 1500);
+      return;
+    }
     const tmp = document.createElement('canvas');
     tmp.width = w; tmp.height = h;
     tmp.getContext('2d').drawImage(video, 0, 0, w, h);
@@ -413,6 +440,7 @@
     vfPlaceholder.innerHTML = 'SCANNER IDLE<br>start the camera or upload a photo';
     startBtn.style.display = 'inline-block';
     captureBtn.disabled = true;
+    captureBtn.textContent = 'Capture';
     captureBtn.style.display = 'inline-block';
     retakeBtn.style.display = 'none';
   });
@@ -463,6 +491,10 @@
     processImage();
   }
 
+  thresholdSlider.addEventListener('input', () => {
+    autoThreshold = false;
+    sensitivityLabel.textContent = 'SENSITIVITY · MANUAL';
+  });
   thresholdSlider.addEventListener('change', () => {
     if(sourceImageData) processImage();
   });
@@ -477,18 +509,65 @@
     // let the UI paint the scanline before we block the thread
     await new Promise(r => setTimeout(r, 60));
 
-    const threshold = parseInt(thresholdSlider.value, 10);
     let blobs = [];
     try{
-      blobs = segment(sourceImageData, threshold);
+      if(autoThreshold){
+        const best = autoSegment(sourceImageData);
+        blobs = best.blobs;
+        thresholdSlider.value = best.threshold;
+        sensitivityLabel.textContent = 'SENSITIVITY · AUTO';
+      } else {
+        const threshold = parseInt(thresholdSlider.value, 10);
+        blobs = segment(sourceImageData, threshold);
+      }
     }catch(err){
       console.error(err);
     }
 
     scanline.classList.remove('active');
-    vfStatus.classList.remove('show');
+
+    if(blobs.length === 0){
+      vfStatus.textContent = 'NO OBJECTS FOUND';
+    } else {
+      vfStatus.textContent = 'FOUND ' + blobs.length + (blobs.length === 1 ? ' OBJECT' : ' OBJECTS');
+    }
+    setTimeout(() => vfStatus.classList.remove('show'), 1600);
 
     renderStickers(blobs);
+
+    if(blobs.length > 0){
+      sheet.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if(autoIdentifyToggle.checked) runAutoIdentify();
+    }
+  }
+
+  // Try a spread of sensitivity values and pick the one that yields the
+  // most plausible result (a handful of objects, not the whole frame).
+  function autoSegment(imageData){
+    const candidates = [22, 30, 38, 48, 60, 74];
+    const { width, height } = imageData;
+    const totalArea = width * height;
+    let best = null;
+
+    for(const t of candidates){
+      let blobs;
+      try{ blobs = segment(imageData, t); } catch(e){ continue; }
+      if(blobs.length === 0) continue;
+
+      const coveredArea = blobs.reduce((s,b) => s + b.area, 0);
+      const coverage = coveredArea / totalArea;
+      // Prefer a handful of objects covering a reasonable (not tiny, not
+      // near-total) portion of the frame.
+      const countScore = -Math.abs(blobs.length - 3);
+      const coverageScore = -Math.abs(coverage - 0.28) * 10;
+      const score = countScore + coverageScore;
+
+      if(!best || score > best.score){
+        best = { threshold: t, blobs, score };
+      }
+    }
+
+    return best || { threshold: 38, blobs: [] };
   }
 
   // Region-growing flood fill from the border to find background,
@@ -682,6 +761,19 @@
       const resultBox = card.querySelector('.identify-result');
       idBtn.addEventListener('click', () => identifySticker(dataUrl, idBtn, resultBox));
     });
+  }
+
+  // Runs Identify on every card currently in the sheet, one at a time,
+  // so requests don't all fire in a burst.
+  async function runAutoIdentify(){
+    const cards = Array.from(sheet.querySelectorAll('.sticker-card'));
+    for(const card of cards){
+      const img = card.querySelector('.sticker-stage img');
+      const idBtn = card.querySelector('.identify-btn');
+      const resultBox = card.querySelector('.identify-result');
+      if(!img || idBtn.disabled) continue;
+      await identifySticker(img.src, idBtn, resultBox);
+    }
   }
 
   function maskAsWhiteSilhouette(cutoutCanvas){
